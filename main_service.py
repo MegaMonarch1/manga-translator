@@ -675,7 +675,6 @@ async def process_batch(image_urls: List[str], source_lang: str, target_lang: st
             {
                 "page_number": page_offset + i + 1,
                 "image_url": img_result_url,
-                "translated_image_url": img_result_url,
                 "original_url": img_url if not img_url.startswith("data:image") else "CANVAS_BASE64",
                 "bubbles": bubbles,
             }
@@ -749,7 +748,7 @@ async def get_chapter_images(payload: GetChapterImagesRequest, user_id: int = De
 
 
 @app.post("/api/translate-page-batch")
-async def translate_page_batch(payload: TranslateBatchRequest):
+async def translate_page_batch(payload: TranslateBatchRequest, user_id: int = Depends(get_current_user)):
     """Client'in kendi elindeki bir URL grubunu (ornegin 10'luk) direkt cevirmesi icin."""
     if not payload.image_urls:
         return {"status": "success", "pages": []}

@@ -27,6 +27,7 @@ import asyncio
 import sqlite3
 import hashlib
 import secrets
+import threading
 from datetime import datetime
 from typing import Optional, List
 
@@ -38,14 +39,19 @@ import httpx
 from PIL import Image, ImageDraw, ImageFont
 
 # --- AYARLAR ---
-DEEPL_API_KEY = os.environ.get("DEEPL_API_KEY", "0e5a2641-3117-427f-a75a-2e52fad165e1:fx")
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_data.db")
+# ANAHTAR KODA YAZILMAZ: Render > Environment kismindan DEEPL_API_KEY olarak girilir.
+DEEPL_API_KEY = os.environ.get("DEEPL_API_KEY", "")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Kalici disk kullaniyorsan Render'da DB_PATH=/data/app_data.db gibi ayarla.
+DB_PATH = os.environ.get("DB_PATH") or os.path.join(BASE_DIR, "app_data.db")
+os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+EASYOCR_DIR = os.path.join(BASE_DIR, ".easyocr")
 
 # Ayri deploy edilen scraper servisinin adresi (Render'da 2. servis olarak acilacak)
 SCRAPER_SERVICE_URL = os.environ.get("SCRAPER_SERVICE_URL", "http://localhost:8001")
 
 BATCH_SIZE = 10
-MAX_CONCURRENT_OCR = 4
+MAX_CONCURRENT_OCR = int(os.environ.get("MAX_CONCURRENT_OCR", "2"))
 ocr_semaphore = asyncio.Semaphore(MAX_CONCURRENT_OCR)
 
 app = FastAPI(title="Manga Translator Engine (OCR/Ceviri servisi)")
@@ -167,7 +173,7 @@ def create_session(conn, user_id: int) -> str:
     return token
 
 
-async def get_current_user(authorization: Optional[str] = Header(None)) -> int:
+def get_current_user(authorization: Optional[str] = Header(None)) -> int:
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Yetkilendirme basligi eksik")
     token = authorization.split(" ", 1)[1].strip()
@@ -291,15 +297,30 @@ def save_library(payload: LibrarySaveRequest, user_id: int = Depends(get_current
 
 # --- OCR LAZY LOADING ---
 ocr_reader = None
+_OCR_INIT_LOCK = threading.Lock()
+OCR_LOCK = threading.Lock()  # readtext ayni anda tek thread'de calissin (RAM + thread guvenligi)
 
 
 def get_ocr_reader():
     global ocr_reader
     if ocr_reader is None:
-        import easyocr
+        with _OCR_INIT_LOCK:
+            if ocr_reader is None:
+                import easyocr
 
-        ocr_reader = easyocr.Reader(["en"], gpu=False)
+                ocr_reader = easyocr.Reader(
+                    ["en"],
+                    gpu=False,
+                    model_storage_directory=EASYOCR_DIR,
+                    user_network_directory=EASYOCR_DIR,
+                )
     return ocr_reader
+
+
+def run_ocr(image_bytes: bytes):
+    reader = get_ocr_reader()
+    with OCR_LOCK:
+        return reader.readtext(image_bytes)
 
 
 # 2. SATIR BIRLESTIRICI (degismedi)
@@ -385,6 +406,10 @@ def translate_batch_texts(texts: List[str], source_lang: str = "en", target_lang
     cleaned_texts = [re.sub(r"\s+", " ", t).strip() for t in texts]
     if not any(cleaned_texts):
         return [""] * len(texts)
+
+    if not DEEPL_API_KEY:
+        print("[DEEPL] DEEPL_API_KEY tanimli degil, ceviri atlandi")
+        return [t.upper() for t in cleaned_texts]
 
     tagged_input = ""
     for idx, txt in enumerate(cleaned_texts):
@@ -558,7 +583,17 @@ def process_and_draw_translation(image: Image.Image, ocr_results, translated_tex
     return image
 
 
-# 8. TEK BIR RESMI CEVIRME (degismedi)
+def _translate_and_render(image, merged_valid_results, raw_texts, source_lang, target_lang):
+    """Senkron/agir isler: DeepL + PIL cizimi + JPEG kodlama. Event loop'u bloklamamak icin thread'de calisir."""
+    translated_texts = translate_batch_texts(raw_texts, source_lang, target_lang)
+    processed_image = process_and_draw_translation(image, merged_valid_results, translated_texts)
+    buffered = io.BytesIO()
+    processed_image.save(buffered, format="JPEG", quality=90)
+    b64_encoded = base64.b64encode(buffered.getvalue()).decode("utf-8")
+    return translated_texts, f"data:image/jpeg;base64,{b64_encoded}"
+
+
+# 8. TEK BIR RESMI CEVIRME
 async def process_single_image(client: httpx.AsyncClient, img_url: str, source_lang: str, target_lang: str):
     bubbles = []
     base64_image_url = ""
@@ -580,8 +615,7 @@ async def process_single_image(client: httpx.AsyncClient, img_url: str, source_l
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         img_w, img_h = image.size
 
-        reader = get_ocr_reader()
-        results = await asyncio.to_thread(reader.readtext, image_bytes)
+        results = await asyncio.to_thread(run_ocr, image_bytes)
 
         valid_results = [
             r for r in results if r[2] > 0.30 and len(re.sub(r"[^a-zA-Z]", "", r[1])) >= 2
@@ -591,14 +625,9 @@ async def process_single_image(client: httpx.AsyncClient, img_url: str, source_l
         merged_valid_results = merge_ocr_lines(filtered_results)
         raw_texts = [r[1] for r in merged_valid_results]
 
-        translated_texts = translate_batch_texts(raw_texts, source_lang, target_lang)
-
-        processed_image = process_and_draw_translation(image, merged_valid_results, translated_texts)
-
-        buffered = io.BytesIO()
-        processed_image.save(buffered, format="JPEG", quality=90)
-        b64_encoded = base64.b64encode(buffered.getvalue()).decode("utf-8")
-        base64_image_url = f"data:image/jpeg;base64,{b64_encoded}"
+        translated_texts, base64_image_url = await asyncio.to_thread(
+            _translate_and_render, image, merged_valid_results, raw_texts, source_lang, target_lang
+        )
 
         for b_id, ((bbox, orig_text, _), tr_text) in enumerate(
             zip(merged_valid_results, translated_texts), start=1
@@ -616,7 +645,7 @@ async def process_single_image(client: httpx.AsyncClient, img_url: str, source_l
                 }
             )
         # Buyuk objeleri elden birakalim (GC'ye yardim)
-        del image, processed_image, image_bytes, buffered
+        del image, image_bytes
     except Exception as ocr_error:
         print(f"Gorsel Isleme Hatasi: {ocr_error}")
 
@@ -656,30 +685,45 @@ async def process_batch(image_urls: List[str], source_lang: str, target_lang: st
 
 # --- SCRAPER SERVISI ILE KONUSMA (10'arli dongu) ---
 async def _scraper_stream_batches(url: str, http_client: httpx.AsyncClient):
-    """scraper_service'den 10'ar 10'ar sayfa gruplarini generator olarak verir."""
-    resp = await http_client.post(f"{SCRAPER_SERVICE_URL}/session/start", json={"url": url}, timeout=90.0)
+    """scraper_service'den 10'ar 10'ar sayfa gruplarini verir. Bitince/hata olunca oturumu kapatir."""
+    resp = await http_client.post(f"{SCRAPER_SERVICE_URL}/session/start", json={"url": url}, timeout=120.0)
     if resp.status_code != 200:
-        # Gercek hatayi Render loglarina da yazdir (client'a sadece kisa ozet gidiyor)
-        print(f"[HATA] Scraper /session/start basarisiz. Status={resp.status_code} URL={SCRAPER_SERVICE_URL}")
-        print(f"[HATA] Scraper yaniti (ilk 2000 karakter): {resp.text[:2000]}")
-        raise HTTPException(status_code=502, detail=f"Scraper servisi hata verdi (status {resp.status_code}). Render loglarina bak.")
+        raise HTTPException(status_code=502, detail=f"Scraper servisi hata verdi ({resp.status_code}): {resp.text}")
     data = resp.json()
-    yield data["images"]
-
     session_id = data.get("session_id")
-    has_more = data.get("has_more", False)
 
-    while session_id and has_more:
-        resp = await http_client.post(
-            f"{SCRAPER_SERVICE_URL}/session/next", json={"session_id": session_id}, timeout=90.0
-        )
-        if resp.status_code != 200:
-            print(f"[HATA] Scraper /session/next basarisiz. Status={resp.status_code}")
-            print(f"[HATA] Scraper yaniti (ilk 2000 karakter): {resp.text[:2000]}")
-            break
-        data = resp.json()
+    try:
         yield data["images"]
         has_more = data.get("has_more", False)
+
+        while session_id and has_more:
+            resp = await http_client.post(
+                f"{SCRAPER_SERVICE_URL}/session/next", json={"session_id": session_id}, timeout=120.0
+            )
+            if resp.status_code != 200:
+                # Sessizce birakma: kullanici eksik bolumu basarili sanmasin
+                raise HTTPException(
+                    status_code=502, detail=f"Scraper /session/next hata verdi ({resp.status_code}): {resp.text}"
+                )
+            data = resp.json()
+            yield data["images"]
+            has_more = data.get("has_more", False)
+    finally:
+        # Kullanici vazgecse / hata olsa da scraper'daki Chromium oturumu kapansin
+        if session_id:
+            try:
+                await http_client.post(
+                    f"{SCRAPER_SERVICE_URL}/session/close", json={"session_id": session_id}, timeout=10.0
+                )
+            except Exception:
+                pass  # scraper'daki TTL temizligi yedek olarak zaten var
+
+
+@app.on_event("startup")
+async def _preload_ocr():
+    """OCR modelini arka planda yukle: ilk istek beklemesin, port hemen acilsin."""
+    if os.environ.get("PRELOAD_OCR", "1") == "1":
+        asyncio.create_task(asyncio.to_thread(get_ocr_reader))
 
 
 @app.get("/")
@@ -688,7 +732,7 @@ def root():
 
 
 @app.post("/api/get-chapter-images")
-async def get_chapter_images(payload: GetChapterImagesRequest):
+async def get_chapter_images(payload: GetChapterImagesRequest, user_id: int = Depends(get_current_user)):
     """Geriye donuk uyumluluk icin: tum sayfalari toplayip tek seferde doner (scraper servisine proxy)."""
     if not payload.url.startswith("http"):
         raise HTTPException(status_code=400, detail="Gecersiz URL formati")
@@ -715,7 +759,7 @@ async def translate_page_batch(payload: TranslateBatchRequest):
 
 
 @app.post("/api/translate-chapter")
-async def translate_chapter(payload: MangaTranslateRequest):
+async def translate_chapter(payload: MangaTranslateRequest, user_id: int = Depends(get_current_user)):
     """
     STREAMING endpoint: scraper servisinden 10'ar 10'ar sayfa ister, her grubu
     isler ve HEMEN client'a bir NDJSON satiri olarak gonderir. Boylece:
@@ -756,13 +800,9 @@ async def translate_chapter(payload: MangaTranslateRequest):
                     # bir sonraki 10'luk gruba gecmeden once bu grubun buyuk
                     # nesnelerini (pages listesi disinda tuttugumuz yok) serbest birak
         except HTTPException as e:
-            print(f"[HATA] translate-chapter stream HTTPException: {e.detail}")
             yield json.dumps({"type": "error", "detail": e.detail}, ensure_ascii=False) + "\n"
             return
         except Exception as e:
-            import traceback
-            print(f"[HATA] translate-chapter stream beklenmeyen hata: {e}")
-            traceback.print_exc()
             yield json.dumps({"type": "error", "detail": str(e)}, ensure_ascii=False) + "\n"
             return
 

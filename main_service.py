@@ -46,6 +46,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.environ.get("DB_PATH") or os.path.join(BASE_DIR, "app_data.db")
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 EASYOCR_DIR = os.path.join(BASE_DIR, ".easyocr")
+# OCR motoru: "rapid" (hafif, 512MB RAM'e sigar) veya "easyocr" (agir, ~1GB+ RAM ister)
+OCR_ENGINE = os.environ.get("OCR_ENGINE", "rapid").lower()
 
 # Ayri deploy edilen scraper servisinin adresi (Render'da 2. servis olarak acilacak)
 SCRAPER_SERVICE_URL = os.environ.get("SCRAPER_SERVICE_URL", "http://localhost:8001")
@@ -306,21 +308,89 @@ def get_ocr_reader():
     if ocr_reader is None:
         with _OCR_INIT_LOCK:
             if ocr_reader is None:
-                import easyocr
+                if OCR_ENGINE == "easyocr":
+                    import easyocr
 
-                ocr_reader = easyocr.Reader(
-                    ["en"],
-                    gpu=False,
-                    model_storage_directory=EASYOCR_DIR,
-                    user_network_directory=EASYOCR_DIR,
-                )
+                    ocr_reader = easyocr.Reader(
+                        ["en"],
+                        gpu=False,
+                        model_storage_directory=EASYOCR_DIR,
+                        user_network_directory=EASYOCR_DIR,
+                    )
+                else:
+                    from rapidocr_onnxruntime import RapidOCR
+
+                    ocr_reader = RapidOCR()
     return ocr_reader
+
+
+RAPID_CHUNK_H = 1000   # uzun (webtoon) gorselleri bu yukseklikte parcalara bol (bellek icin kucuk tutuldu)
+RAPID_OVERLAP = 150    # parcalar arasi ortusme (satir ortadan kesilmesin)
+
+
+def _fix_missing_spaces(text: str) -> str:
+    """RapidOCR bazen kelime aralarindaki bosluklari dusurur (ORNEK: LASTLINEATEND). 9+ harfli
+    yapisik dizileri wordninja ile ayirir; gercek uzun kelimelere (UNBELIEVABLE) dokunmaz."""
+    try:
+        import wordninja
+    except Exception:
+        return text
+
+    def repl(m):
+        w = m.group(0)
+        if len(set(w.lower())) <= 3:  # AAAAAAAH gibi uzatmalar
+            return w
+        parts = wordninja.split(w)
+        if len(parts) < 2 or any(len(p) == 1 and p.lower() not in ("a", "i") for p in parts):
+            return w
+        out = " ".join(parts)
+        return out.upper() if w.isupper() else (out.capitalize() if w[0].isupper() else out)
+
+    return re.sub(r"[A-Za-z]{9,}", repl, text)
+
+
+def _rapid_readtext(engine, image_bytes: bytes):
+    """RapidOCR'i EasyOCR ile ayni formatta sonuc verecek sekilde calistirir: [(bbox, text, prob), ...]"""
+    import numpy as np
+
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    arr = np.array(img)[:, :, ::-1]  # RGB -> BGR
+    h = arr.shape[0]
+
+    if h <= RAPID_CHUNK_H + RAPID_OVERLAP:
+        chunks = [(0, h)]
+    else:
+        chunks, y = [], 0
+        while y < h:
+            end = min(h, y + RAPID_CHUNK_H)
+            chunks.append((y, end))
+            if end >= h:
+                break
+            y = end - RAPID_OVERLAP
+
+    out = []
+    for i, (y0, y1) in enumerate(chunks):
+        res, _ = engine(np.ascontiguousarray(arr[y0:y1]))
+        if not res:
+            continue
+        # Ortusme bolgesindeki tekrarlari onle: her y, sadece bir parcanin "sahip" oldugu araliga girer
+        keep_from = y0 + (RAPID_OVERLAP // 2 if i > 0 else 0)
+        keep_to = y1 - (RAPID_OVERLAP // 2 if i < len(chunks) - 1 else 0)
+        for box, text, score in res:
+            gbox = [[float(p[0]), float(p[1]) + y0] for p in box]
+            cy = sum(p[1] for p in gbox) / 4.0
+            if len(chunks) > 1 and not (keep_from <= cy < keep_to):
+                continue
+            out.append((gbox, _fix_missing_spaces(str(text)), float(score)))
+    return out
 
 
 def run_ocr(image_bytes: bytes):
     reader = get_ocr_reader()
     with OCR_LOCK:
-        return reader.readtext(image_bytes)
+        if OCR_ENGINE == "easyocr":
+            return reader.readtext(image_bytes)
+        return _rapid_readtext(reader, image_bytes)
 
 
 # 2. SATIR BIRLESTIRICI (degismedi)

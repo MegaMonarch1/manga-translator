@@ -659,7 +659,10 @@ async def _scraper_stream_batches(url: str, http_client: httpx.AsyncClient):
     """scraper_service'den 10'ar 10'ar sayfa gruplarini generator olarak verir."""
     resp = await http_client.post(f"{SCRAPER_SERVICE_URL}/session/start", json={"url": url}, timeout=90.0)
     if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"Scraper servisi hata verdi: {resp.text}")
+        # Gercek hatayi Render loglarina da yazdir (client'a sadece kisa ozet gidiyor)
+        print(f"[HATA] Scraper /session/start basarisiz. Status={resp.status_code} URL={SCRAPER_SERVICE_URL}")
+        print(f"[HATA] Scraper yaniti (ilk 2000 karakter): {resp.text[:2000]}")
+        raise HTTPException(status_code=502, detail=f"Scraper servisi hata verdi (status {resp.status_code}). Render loglarina bak.")
     data = resp.json()
     yield data["images"]
 
@@ -671,6 +674,8 @@ async def _scraper_stream_batches(url: str, http_client: httpx.AsyncClient):
             f"{SCRAPER_SERVICE_URL}/session/next", json={"session_id": session_id}, timeout=90.0
         )
         if resp.status_code != 200:
+            print(f"[HATA] Scraper /session/next basarisiz. Status={resp.status_code}")
+            print(f"[HATA] Scraper yaniti (ilk 2000 karakter): {resp.text[:2000]}")
             break
         data = resp.json()
         yield data["images"]
@@ -751,9 +756,13 @@ async def translate_chapter(payload: MangaTranslateRequest):
                     # bir sonraki 10'luk gruba gecmeden once bu grubun buyuk
                     # nesnelerini (pages listesi disinda tuttugumuz yok) serbest birak
         except HTTPException as e:
+            print(f"[HATA] translate-chapter stream HTTPException: {e.detail}")
             yield json.dumps({"type": "error", "detail": e.detail}, ensure_ascii=False) + "\n"
             return
         except Exception as e:
+            import traceback
+            print(f"[HATA] translate-chapter stream beklenmeyen hata: {e}")
+            traceback.print_exc()
             yield json.dumps({"type": "error", "detail": str(e)}, ensure_ascii=False) + "\n"
             return
 

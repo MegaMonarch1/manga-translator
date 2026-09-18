@@ -3,4 +3,5 @@ uvicorn[standard]
 httpx
 pydantic
 Pillow
-easyocr
+rapidocr-onnxruntime
+wordninja

@@ -1,7 +1,0 @@
-fastapi
-uvicorn[standard]
-httpx
-pydantic
-Pillow
-rapidocr-onnxruntime
-wordninja
